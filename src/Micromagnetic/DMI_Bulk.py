@@ -1,3 +1,9 @@
+import ufl
+import numpy as np
+from dolfinx import fem
+from petsc4py import PETSc
+from dolfinx.fem.petsc import assemble_matrix
+
 class DMIBULK:
     def __init__(self, mesh, V, V1, D, Ms,  VolNodos):         
         mesh_in_nm = True
