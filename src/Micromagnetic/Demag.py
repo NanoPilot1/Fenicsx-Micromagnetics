@@ -35,7 +35,7 @@ class DemagField:
         self.comm =  self.mesh.comm
         self.rank =  self.comm.Get_rank()
 
-        with dolfinx.io.XDMFFile(self.mesh.comm, "tmp_mesh.xdmf", "w") as xdmf:
+        with io.XDMFFile(self.mesh.comm, "tmp_mesh.xdmf", "w") as xdmf:
              xdmf.write_mesh(self.mesh)
 
         num_owned_nodes = self.mesh.geometry.index_map().size_local
