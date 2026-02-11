@@ -6,13 +6,9 @@ from dolfinx.fem.petsc import assemble_matrix
 
 
 class CubicAnisotropyField:
-    def __init__(self, mesh, V, K1, Ms, u1, u2):
+    def __init__(self, mesh, V, K1, Ms, u1, u2, length_scale_to_m=1.0):
         """
-        u1, u2: arrays (3*N) that represents the normalized anisotropy cubic axis.
-        u3 is obatained by np.cross(u1,u2)
-        K1: cubic anisotropy constant
-        H: cubic effective field in unit of A/m
-
+        u1, u2: arrays (3*N) in the order of depth of field (DOF) of V (vector P1)
         """
 
         self.mesh = mesh
@@ -22,26 +18,33 @@ class CubicAnisotropyField:
         self.mu_0 = 4.0 * np.pi * 1e-7
 
 
+        self.vol_scale = 1e-27
+
         self.u1 = fem.Function(V)
         self.u2 = fem.Function(V)
         self.u3 = fem.Function(V)
 
+
+
         self.u1.x.array[:] = np.asarray(u1, dtype=np.float64)
         self.u2.x.array[:] = np.asarray(u2, dtype=np.float64)
 
+
+   
+
+        # Views (with ghosts)
         self.u1A = self.u1.x.array.reshape(-1, 3)
         self.u2A = self.u2.x.array.reshape(-1, 3)
         self.u3A = self.u3.x.array.reshape(-1, 3)
 
-
+        # --- orthonormalization per node ---
         def _normalize(A, eps=1e-30):
             n = np.linalg.norm(A, axis=1)
             n = np.where(n > eps, n, 1.0)
             A /= n[:, None]
 
         _normalize(self.u1A)
-
-        # Gram-Schmidt: 
+        # Gram-Schmidt: u2 <- u2 - (u2 . u1) u1
 
         dp = np.einsum("ij,ij->i", self.u2A, self.u1A)
         self.u2A[:] = self.u2A - dp[:, None] * self.u1A
@@ -51,11 +54,12 @@ class CubicAnisotropyField:
         self.u3A[:] = np.cross(self.u1A, self.u2A)
         _normalize(self.u3A)
 
-        # Orthogonality check
+        # Orthogonality check (diagnostic)
         dp12 = np.einsum("ij,ij->i", self.u1A, self.u2A)
         if self.mesh.comm.rank == 0:
             print(f"[Cubic] max|u1 . u2| = {np.max(np.abs(dp12)):.3e}", flush=True)
 
+        # Prefactor H (A/m)
         self.pref = (2.0 * self.K1) / (self.mu_0 * self.M_s) if self.M_s != 0.0 else 0.0
 
         self.H = fem.Function(V)
@@ -137,7 +141,8 @@ class CubicAnisotropyField:
 
     def Energy(self, m):
 
-        dE = -ufl.dot(m, self.H) * ufl.dx
-        Eloc = fem.assemble_scalar(fem.form(dE))
-        return 0.25 * self.mu_0 * self.M_s * float(Eloc) * 1e-27
+        self.compute(m)
 
+        integrand = -ufl.dot(m, self.H) * ufl.dx
+        Eloc = fem.assemble_scalar(fem.form(integrand))
+        return 0.25 * self.mu_0 * self.M_s * float(Eloc) * self.vol_scale
