@@ -12,10 +12,6 @@ from dolfinx.fem.petsc import assemble_matrix, assemble_vector
 We implement the interfacial Dzyaloshinskii-Moriya interaction according to Phys. Rev. Lett. 120, 067201 (2018). In that case,
 the effective field is given by HDMI = -2D/Ms (n (nabla cdot m) - nabla (m cdot n))
 
-D: interfacial dzyaloshinskii-moriya constant in units of J/m^2
-Ms: Saturation magnetisation in units of A/m
-H_DMI:  Interfacial dzyaloshinskii-moriya field in unit of A/m
-
 '''
 
 
@@ -71,13 +67,13 @@ class DMIInterfacial:
 
     def compute(self, m):
 
-        self.K.mult(m.x.petsc_vec, self.H_DMI.x.petsc_vec)       
-        self.H_DMI.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
+        self.K.mult(m.x.petsc_vec, self.H_DMI.x.petsc_vec)     # K is local, we do not update the ghost in this part
+        #self.H_DMI.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
         return self.H_DMI
 
 
     def Energy(self, m):
-
+        self.H_DMI.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
         dE = ufl.inner(m, self.H_DMI) * ufl.dx
         energy = -0.5 * self.mu_0 * self.Ms * fem.assemble_scalar(fem.form(dE)) * 1e-27
         return energy
