@@ -10,7 +10,7 @@ class ZhangLi:
 
         '''
          Jdir: Normalized vector
-         
+
         '''
 
         self.mesh = mesh
@@ -44,8 +44,8 @@ class ZhangLi:
     # --------------------------------------------------------------------------
 
     def compute(self, m):
-        self.ZhangLi.x.petsc_vec.set(0.0)
+        #self.ZhangLi.x.petsc_vec.set(0.0)
         self.K_J.mult(m.x.petsc_vec, self.ZhangLi.x.petsc_vec)
-        self.ZhangLi.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
+        #self.ZhangLi.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
         return self.ZhangLi
 
