@@ -9,10 +9,10 @@ class AnisotropyField:
     def __init__(self, mesh,  V,  Ku, Ms, AniVec, VolN):
 
         '''
-            AniVec is the normalized easy anisotropy axis.
+            AniVec is a easy anisotropy axis vector.
             Ku: is the anisotropy constant in units of J/m^3.
             Ms: is the  saturation magnetization in units of A/m.
-            H_anis:  uniaxial anisotropy field in unit of A/m
+
         '''
 
         self.mesh = mesh
@@ -41,16 +41,15 @@ class AnisotropyField:
 
 
     def compute(self, m):
-        self.H_anis.x.petsc_vec.set(0.0)
-        self.K.mult(m.x.petsc_vec, self.H_anis.x.petsc_vec )
-        self.H_anis.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
+        #self.H_anis.x.petsc_vec.set(0.0)
+        self.K.mult(m.x.petsc_vec, self.H_anis.x.petsc_vec ) # K is local, we do not update the ghost in this part
+        #self.H_anis.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
     
         return self.H_anis
         #return self.prefactor * (self.temp_vec.array[self.start:self.end] / self.volNodos[self.start:self.end])
 
 
     def Energy(self, m):
-
-        dE =- ufl.dot(m, self.H_anis ) * ufl.dx
-        return 1/2*self.mu_0 * self.M_s*fem.assemble_scalar(fem.form(dE))*1e-27
-
+        self.H_anis.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)  
+        integrand =- ufl.dot(m, self.H_anis ) * ufl.dx
+        return 1/2*self.mu_0 * self.M_s*fem.assemble_scalar(fem.form(integrand))*1e-27
