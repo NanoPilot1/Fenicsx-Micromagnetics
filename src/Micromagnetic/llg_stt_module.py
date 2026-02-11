@@ -17,7 +17,7 @@ from dolfinx.fem.petsc import assemble_vector
 import adios4dolfinx as ad
 
 from .Exchange import ExchangeField
-from .Demag import DemagField
+#from .Demag import DemagField
 from .Anisotropy import AnisotropyField
 from .DMI_Bulk import DMIBULK
 from .DMI_Interfacial import DMIInterfacial
@@ -46,6 +46,8 @@ class EffectiveFieldSTT:
         P=0.0,
         beta=0.0,
         use_demag=True, 
+        demag_method="lindholm",
+        demag_kwargs=None,
     ):
         self.mesh = mesh
         self.V = fem.functionspace(
@@ -69,7 +71,10 @@ class EffectiveFieldSTT:
         self.n0_int = fem.Function(self.V)
         self.n0_int.x.array[:] = n0_int_vec
 
-        self.H0 = H0_vec.copy()
+        self.H0_ext = fem.Function(self.V)
+        self.H0_ext.x.array[:] = H0_vec.copy()
+        self.H0_ext.x.scatter_forward()
+
 
         self.comm = self.mesh.comm
         self.m = fem.Function(self.V)
@@ -96,7 +101,13 @@ class EffectiveFieldSTT:
             / 1e-9
         )
 
-        self.n_nodes_local = len(self.mesh.geometry.x)
+        self.n_nodes_local =  self.V.dofmap.index_map.size_local
+
+        self.start, self.end = self.V.dofmap.index_map.local_range
+        owned_dofs = self.end - self.start
+        self.local_dofs = self.end - self.start
+        self.local_size = 3 * self.local_dofs
+
 
         self.mx = np.zeros(self.n_nodes_local)
         self.my = np.zeros(self.n_nodes_local)
@@ -132,7 +143,8 @@ class EffectiveFieldSTT:
 
         self.zhang_le = np.zeros(3 * self.n_nodes_local)
 
-
+        self.He = np.zeros(3 * self.n_nodes_local)
+        
         v = ufl.TestFunction(self.V)
         paso1 = ufl.dot(
             v, Constant(self.mesh, PETSc.ScalarType((1.0, 1.0, 1.0)))
@@ -153,10 +165,27 @@ class EffectiveFieldSTT:
         self.dmdt = Function(self.V)
 
 
-        self.demag_field = None             
-        if self.use_demag:                  
-            self.demag_field = DemagField(self.mesh, self.V, self.V1, self.Ms)
-            self.demag_field.compute(self.m)
+        self.demag_field = None
+        if self.use_demag:
+            from .Demag import make_demag_field
+
+            if demag_kwargs is None:
+                demag_kwargs = {}
+
+            if self.mesh.comm.rank == 0:
+                print(f"[Demag-STT] Precomputing demag method='{demag_method}' ...", flush=True)
+
+            t0 = perf_counter()
+            self.demag_field = make_demag_field(
+                demag_method, self.mesh, self.V, self.V1, self.Ms, **demag_kwargs
+            )
+            t1 = perf_counter()
+
+            if self.mesh.comm.rank == 0:
+                print(f"[Demag-STT] Precomputation finished in {t1 - t0:.2f} s", flush=True)
+
+
+            
 
         self.exchange_field = ExchangeField(
             self.mesh, self.V, self.A, self.Ms, volNodos
@@ -194,15 +223,13 @@ class EffectiveFieldSTT:
         if self.DMI_int is not None:
             self.K_total = self.K_total + self.DMI_int.K
 
-        self.m_jac = Function(self.V)
         self.v_jac = Function(self.V)
+        self.v_jac.x.array[:] = 0
 
-        self.start, self.end = self.V.dofmap.index_map.local_range
 
         self.H_m = Function(self.V)
         self.H_v = Function(self.V)
 
-        owned_dofs = self.end - self.start
 
         self.Jv_buffer = np.zeros(3 * owned_dofs, dtype=np.float64)
 
@@ -216,25 +243,22 @@ class EffectiveFieldSTT:
 
     def compute_H_eff(self, m):
   
-        H = self.exchange_field.compute(m).x.array
+        self.He[:] = self.exchange_field.compute(m).x.petsc_vec.array
 
         if self.demag_field is not None:  
-            H += self.demag_field.compute(m).x.array
+            self.He += self.demag_field.compute(m).x.petsc_vec.array
 
         if abs(self.Ku) > 0.0:
-            H += self.anisotropy_field.compute(m).x.array
-
+            self.He += self.anisotropy_field.compute(m).x.petsc_vec.array
         if abs(self.D_bulk) > 0.0:
-            H += self.DMIBULK.compute(m).x.array
+            self.He += self.DMIBULK.compute(m).x.petsc_vec.array
 
         if self.DMI_int is not None and abs(self.D_int) > 0.0:
-            H += self.DMI_int.compute(m).x.array
+            self.He += self.DMI_int.compute(m).x.petsc_vec.array
 
-        H += self.H0
+        self.He += self.H0_ext.x.petsc_vec.array
 
-        self.H_eff.x.array[:] = H
-        self.H_eff.x.scatter_forward()
-        return self.H_eff.x.array
+        return self.He
 
  
     def compute_Energy(self, m):
@@ -259,49 +283,34 @@ class EffectiveFieldSTT:
         return E_exch + E_demag + E_ani + E_dmi_bulk + E_dmi_int
 
 
-    def update_jac_state(self, m_vec):
-
-        self.m_jac.x.array[:self.local_size] = m_vec
-        self.m_jac.x.petsc_vec.ghostUpdate(
-            addv=PETSc.InsertMode.INSERT_VALUES,
-            mode=PETSc.ScatterMode.FORWARD,
-        )
+    def update_jac_state(self):
 
 
-        self.H_m.x.petsc_vec.set(0.0)
-        self.K_total.mult(self.m_jac.x.petsc_vec, self.H_m.x.petsc_vec)
-        self.H_m.x.scatter_forward()
+        self.K_total.mult(self.m.x.petsc_vec, self.H_m.x.petsc_vec)
 
-        M_loc = m_vec.reshape(-1, 3)
-        Hm_loc = self.H_m.x.array[:self.local_size].reshape(-1, 3)
+        M_loc =  self.m.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
+        Hm_loc = self.H_m.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
 
         self.M_cached[:, :] = M_loc
-        self.Hm_cached[:, :] = Hm_loc
+        self.Hm_cached[:, :] = Hm_loc + self.H0_ext.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
 
 
-        Jgm = self.ZhangLi.compute(self.m_jac).x.petsc_vec.getArray(
-            readonly=True
-        ).reshape(-1, 3)
+        Jgm = self.ZhangLi.compute(self.m).x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
         self.JdotGrad_m_cache[:, :] = Jgm
 
-    def jac_vec_times_STT(self, m_unused, v, out):
+    def jac_vec_times_STT(self, v, out):
 
 
         self.pasosJac += 1
 
-        self.H_v.x.petsc_vec.set(0.0)
+
         self.v_jac.x.array[:self.local_size] = v
-        self.v_jac.x.petsc_vec.ghostUpdate(
-            addv=PETSc.InsertMode.INSERT_VALUES,
-            mode=PETSc.ScatterMode.FORWARD,
-        )
+
 
         self.K_total.mult(self.v_jac.x.petsc_vec, self.H_v.x.petsc_vec)
-        self.H_v.x.scatter_forward()
 
-        JdotGrad_v = self.ZhangLi.compute(self.v_jac).x.petsc_vec.getArray(
-            readonly=True
-        ).reshape(-1, 3)
+
+        JdotGrad_v = self.ZhangLi.compute(self.v_jac).x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
 
         M = self.M_cached
         Hm = self.Hm_cached
@@ -354,9 +363,9 @@ class EffectiveFieldSTT:
     def llg_rhs_STT(self, m):
         self.pasosLLG += 1
 
-        m_numeric = m.x.array
-        self.Hfield[:] = self.compute_H_eff(m)
-        self.zhang_le[:] = self.ZhangLi.compute(m).x.array
+        m_numeric = m.x.petsc_vec.getArray(readonly=True)   
+        self.Hfield[:] = self.compute_H_eff(m)                    
+        self.zhang_le[:] = self.ZhangLi.compute(m).x.petsc_vec.array
 
         self.mx[:] = m_numeric[0::3]
         self.my[:] = m_numeric[1::3]
@@ -392,32 +401,17 @@ class EffectiveFieldSTT:
         self.mcmy[:] = self.mz * self.mcx - self.mx * self.mcz
         self.mcmz[:] = self.mx * self.mcy - self.my * self.mcx
 
-        self.dmdt.x.array[0::3] = (
+        self.dmdt.x.petsc_vec.array[0::3] = (
             self.prefactor * (self.do_precess * self.mcx + self.alpha * self.mcmx)
-            - self.prefZhang
-            * (
-                (self.beta - self.alpha) * self.Zcx
-                + (1.0 + self.alpha * self.beta) * self.ZZcx
-            ) + self.Stab*(1.0 - self.norma) * self.mx[:]
-        )
+            - self.prefZhang * ((self.beta - self.alpha) * self.Zcx+ (1.0 + self.alpha * self.beta) * self.ZZcx) + self.Stab*(1.0 - self.norma) * self.mx[:])
 
-        self.dmdt.x.array[1::3] = (
+        self.dmdt.x.petsc_vec.array[1::3] = (
             self.prefactor * (self.do_precess * self.mcy + self.alpha * self.mcmy)
-            - self.prefZhang
-            * (
-                (self.beta - self.alpha) * self.Zcy
-                + (1.0 + self.alpha * self.beta) * self.ZZcy
-            ) + self.Stab*(1.0 - self.norma) * self.my[:]
-        )
+            - self.prefZhang * ((self.beta - self.alpha) * self.Zcy+ (1.0 + self.alpha * self.beta) * self.ZZcy ) + self.Stab*(1.0 - self.norma) * self.my[:])
 
-        self.dmdt.x.array[2::3] = (
+        self.dmdt.x.petsc_vec.array[2::3] = (
             self.prefactor * (self.do_precess * self.mcz + self.alpha * self.mcmz)
-            - self.prefZhang
-            * (
-                (self.beta - self.alpha) * self.Zcz
-                + (1.0 + self.alpha * self.beta) * self.ZZcz
-            ) + self.Stab*(1.0 - self.norma) * self.mz[:]
-        )
+            - self.prefZhang * ((self.beta - self.alpha) * self.Zcz+ (1.0 + self.alpha * self.beta) * self.ZZcz) + self.Stab*(1.0 - self.norma) * self.mz[:])
 
         return self.dmdt
 
@@ -428,7 +422,7 @@ class EffectiveFieldSTT:
         self.m.x.scatter_forward()
 
         dmdt = self.llg_rhs_STT(self.m)
-        dmdt.x.scatter_forward()
+        #dmdt.x.scatter_forward()
 
         f.waxpy(-1.0, dmdt.x.petsc_vec, ydot)
         return 0
@@ -461,6 +455,9 @@ class LLG_STT:
 
         self._has_exchange = False
         self._has_demag = False  
+        self._demag_method = "lindholm"
+        self._demag_kwargs = {}
+
         self._has_anisotropy = False
         self._has_dmi_bulk = False
         self._has_dmi_int = False
@@ -474,8 +471,10 @@ class LLG_STT:
         self._Aex = Aex
         self._has_exchange = True
 
-    def add_demag(self):
+    def add_demag(self, method="lindholm", **kwargs):
         self._has_demag = True
+        self._demag_method = method
+        self._demag_kwargs = dict(kwargs)
 
     def add_anisotropy(self, Ku, n_vec):
         self._Ku = Ku
@@ -561,6 +560,8 @@ class LLG_STT:
             P=P,
             beta=beta,
             use_demag=self._has_demag,
+            demag_method=self._demag_method,
+            demag_kwargs=self._demag_kwargs,
         )
 
     def solve(
@@ -575,8 +576,8 @@ class LLG_STT:
         ts_rtol=1e-6,
         ts_atol=1e-6,
         snes_rtol=1e-2,
-        snes_atol=1e-4,
-        ksp_rtol=1e-4,
+        snes_atol=1e-5,
+        ksp_rtol=1e-5,
         monitor_fn=None,
     ):
         
@@ -585,7 +586,7 @@ class LLG_STT:
             self._build_effective_field()
         hef = self.hef
 
-        # initial state
+        # estado inicial
         hef.m.x.array[:] = m0_array
         hef.m.x.scatter_forward()
 
@@ -651,7 +652,7 @@ class LLG_STT:
 
                 self.enable_pc = True
 
-                # PC buffers 
+                # buffers del PC
                 self.w = None
                 self.denom = None
                 self.s_eff = None
@@ -714,13 +715,17 @@ class LLG_STT:
 
                 Stab = self.Stab
 
+                # productos escalares
                 mdH = mx*hx + my*hy + mz*hz
                 mdm = mx*mx + my*my + mz*mz
 
+                # --- Construir J_ij sin crear B,C,S como tensores ---
+                # S_H (skew de H): S(a) x = a × x
                 # S_H =
                 # [ 0  -hz  hy
                 #   hz  0  -hx
                 #  -hy  hx  0 ]
+                # S_m idem con m. Y tú usas: -c1*(S_H - kappa*S_m)
 
                 Jp00 = 0.0
                 Jp01 = -c1*(-hz - kappa*(-mz))   # -c1*(S_H01 - kappa*S_m01)
@@ -733,8 +738,8 @@ class LLG_STT:
                 Jp22 = 0.0
 
                 # Parte damping local: Jd = c2*(B + kappa*C)
-                # B_ij = (m. H) delta_ij + m_i H_j - 2 H_i m_j
-                # C_ij = m_i m_j - (m.m) delta_ij
+                # B_ij = (m·H)δ_ij + m_i H_j - 2 H_i m_j
+                # C_ij = m_i m_j - (m·m)δ_ij
 
                 B00 = mdH + mx*hx - 2*hx*mx  # = mdH - hx*mx
                 B11 = mdH - hy*my
@@ -883,9 +888,8 @@ class LLG_STT:
                 self.calls += 1
                 xv = x.getArray(readonly=True)
                 yv = y.getArray()
-
-                m_vec = self.hef.m.x.petsc_vec.getArray(readonly=True)
-                self.hef.jac_vec_times_STT(m_vec, xv, out=self.hef.Jv_buffer)
+                
+                self.hef.jac_vec_times_STT( xv, out=self.hef.Jv_buffer)
 
                 yv[:] = self.shift * xv - self.hef.Jv_buffer
 
@@ -915,10 +919,8 @@ class LLG_STT:
 
         def IJac(ts_, t, y, ydot, shift, A, B):
             y.copy(hef.m.x.petsc_vec)
-            hef.m.x.scatter_forward()
 
-            mloc = hef.m.x.petsc_vec.getArray(readonly=True)
-            hef.update_jac_state(mloc)
+            hef.update_jac_state()
 
             ctx.update_pc_full_fast(shift, include_stab=True, use_abs_kappa=True)
 
@@ -931,12 +933,13 @@ class LLG_STT:
         ts.setFromOptions()
 
         y = hef.m.x.petsc_vec.copy()
-        y.ghostUpdate(
-            addv=PETSc.InsertMode.INSERT_VALUES,
-            mode=PETSc.ScatterMode.FORWARD,
-        )
+        y.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,mode=PETSc.ScatterMode.FORWARD,)
 
-        # ----------------- Monitor -----------------
+        # compute the field at t = 0
+        
+        hef.m.x.scatter_forward()
+        hef.compute_H_eff(hef.m)
+
         if dt_save is not None:
             if dt_snap is None:
                 dt_snap = dt_save
@@ -950,24 +953,6 @@ class LLG_STT:
             snap_counter = {"k": 0}
             first_print = {"done": False}
 
-
-            def renormalize_m(u_vec, hef_):
-
-                u_vec.copy(hef_.m.x.petsc_vec)
-                hef_.m.x.scatter_forward()
-
-                arr = hef_.m.x.array 
-                mx = arr[0::3]
-                my = arr[1::3]
-                mz = arr[2::3]
-
-                norma = np.sqrt(mx * mx + my * my + mz * mz)
-                mask = norma > 0.0
-                mx[mask] /= norma[mask]
-                my[mask] /= norma[mask]
-                mz[mask] /= norma[mask]
-
-                hef_.m.x.scatter_forward()
 
 
 
@@ -997,14 +982,10 @@ class LLG_STT:
                 DMI_bulk_total = mesh_.comm.gather(DMI_bulk, root=0)
                 DMI_int_total = mesh_.comm.gather(DMI_int, root=0)
 
-                mag = mesh_.comm.gather(
-                    hef_.m.x.petsc_vec.getArray(readonly=True), root=0
-                )
+                mag = mesh_.comm.gather(hef_.m.x.petsc_vec.getArray(readonly=True), root=0)
 
 
-                torque_norm = np.sqrt(
-                    hef_.mcx**2 + hef_.mcy**2 + hef_.mcz**2
-                )
+                torque_norm = np.sqrt(hef_.mcx**2 + hef_.mcy**2 + hef_.mcz**2)
                 max_torque_local = np.max(torque_norm)
                 max_torque_all = mesh_.comm.gather(max_torque_local, root=0)
 
@@ -1028,12 +1009,12 @@ class LLG_STT:
                     E_di = np.sum(DMI_int_total)
                     E_tot = E_exch + E_demag + E_ani + E_db + E_di
 
-                    maxtorque = 4 * np.pi * 1e-7 * max(max_torque_all)
+                    maxmxh = 4 * np.pi * 1e-7 * max(max_torque_all)
 
                     if not first_print["done"]:
                         header = (
                             f"{'time':>10} {'<mx>':>15} {'<my>':>15} {'<mz>':>15} "
-                            f"{'maxtorque':>15} "
+                            f"{'max(mxh)':>15} "
                             f"{'E_demag':>15} {'E_exch':>15} {'E_ani':>15} "
                             f"{'E_dmi_bulk':>15} {'E_dmi_int':>15} {'E_total':>15}"
                         )
@@ -1045,7 +1026,7 @@ class LLG_STT:
                     line = (
                         f"{t*1e9:10.4f} "
                         f"{mag[:,0].mean():15.6f} {mag[:,1].mean():15.6f} {mag[:,2].mean():15.6f} "
-                        f"{maxtorque:15.4e} "
+                        f"{maxmxh:15.4e} "
                         f"{E_demag:15.4e} {E_exch:15.4e} {E_ani:15.4e} "
                         f"{E_db:15.4e} {E_di:15.4e} {E_tot:15.4e}"
                     )
@@ -1058,7 +1039,6 @@ class LLG_STT:
                 n = int(np.trunc(t / dt_save))
 
                 #if step % 2 == 0:
-                #renormalize_m(u, hef)
 
                 if n != last_save_n["n"]:
                     last_save_n["n"] = n
