@@ -51,5 +51,5 @@ class AnisotropyField:
 
     def Energy(self, m):
         self.H_anis.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)  
-        integrand =- ufl.dot(m, self.H_anis ) * ufl.dx
-        return 1/2*self.mu_0 * self.M_s*fem.assemble_scalar(fem.form(integrand))*1e-27
+        dE =- ufl.dot(m, self.H_anis ) * ufl.dx
+        return 1/2*self.mu_0 * self.M_s*fem.assemble_scalar(fem.form(dE))*1e-27
