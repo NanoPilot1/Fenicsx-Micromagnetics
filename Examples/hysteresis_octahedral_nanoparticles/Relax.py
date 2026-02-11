@@ -74,7 +74,9 @@ Kc1 = 30e3
 llg = LLG(mesh, Ms, gamma=2.211e5, alpha=1.0, do_precess=0)
 
 llg.add_exchange(Aex=Aex )
-llg.add_demag()
+llg.add_demag(method="lindholm")
+#llg.add_demag(method="bempp")
+#llg.add_demag(method="fmm")
 llg.add_cubic_anisotropy(Kc1=Kc1, u1_vec=u1, u2_vec=u2)
 
 
