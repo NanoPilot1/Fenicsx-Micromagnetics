@@ -203,7 +203,7 @@ if __name__ == "__main__":
     from dolfinx.io import VTKFile
 
 
-    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "Lomo.xdmf", "r") as xdmf:
+    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "Sphere.xdmf", "r") as xdmf:
          mesh = xdmf.read_mesh(name="Grid")
 
 
