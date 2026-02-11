@@ -10,7 +10,6 @@ class ExchangeField:
         """
         A: Exchange constant (J/m)
         Ms: is the  saturation magnetization in units of A/m.
-        H_exch:  exchange field in unit of A/m
         """
         self.mesh = mesh
         self.A = A
@@ -24,6 +23,8 @@ class ExchangeField:
         self.K = assemble_matrix(fem.form(self.a))
         self.K.assemble()
 
+        print(type(self.K))  
+
         self.H_exch = fem.Function(self.V)
         prefactor = fem.Function(self.V)
         prefactor.x.array[:] = -2 * self.A /VolN[:]/ (self.mu_0 * self.M_s) / 1e-18
@@ -32,10 +33,13 @@ class ExchangeField:
         #.diagonalScale(self.exchange_field.prefactor, None)
 
     def compute(self, m):
+        """
+        m: dolfinx.fem.Function actualizado con el nuevo campo de magnetización
+        """
 
-        self.H_exch.x.petsc_vec.set(0.0)
-        self.K.mult(m.x.petsc_vec, self.H_exch.x.petsc_vec )
-        self.H_exch.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
+        #self.H_exch.x.petsc_vec.set(0.0)
+        self.K.mult(m.x.petsc_vec, self.H_exch.x.petsc_vec ) # K is local, we do not update the ghost in this part
+        #self.H_exch.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
 
 
         return self.H_exch
