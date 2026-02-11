@@ -84,7 +84,9 @@ Aex = 13.0e-12
 llg = LLG_STT(mesh, Ms = Ms, gamma=2.211e5, alpha=0.1, do_precess=1)
 
 llg.add_exchange(Aex=Aex )
-llg.add_demag()
+llg.add_demag(method="lindholm")
+#llg.add_demag(method="bempp")
+#llg.add_demag(method="fmm")
 
 llg.add_current(Jmagnitude=1e12, Jdir_vec=Je_Array , P=1.0, beta=0.05)
 
@@ -107,7 +109,7 @@ y_final, ctx, elapsed = llg.solve(
     dt_init,
     dt_save=dt_print,
     dt_snap=dt_snap,
-    output_dir="STT2",
+    output_dir="STT",
     ts_rtol=1.0e-6,
     ts_atol=1.0e-6,
     monitor_fn=None
