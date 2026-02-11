@@ -5,7 +5,7 @@ from dolfinx.fem.petsc import (assemble_vector,)
 from mpi4py import MPI
 
 from .Exchange import ExchangeField
-from .Demag import DemagField
+
 from .Anisotropy import AnisotropyField
 from .DMI_Bulk import DMIBULK
 from .DMI_Interfacial import DMIInterfacial
@@ -42,7 +42,10 @@ class EffectiveField:
         alpha=0.5,
         do_precess=1,
         use_demag=True,
-        H0_static=None,       
+        demag_method="lindholm",
+        demag_kwargs=None,
+        H0_static=None,   
+        H_time_func=None   
     ):
 
         self.mesh = mesh
@@ -74,17 +77,30 @@ class EffectiveField:
         self.comm = self.mesh.comm
         self.m = fem.Function(self.V)
 
+
+        self.H_time_func = H_time_func
+
         self.H_eff = fem.Function(self.V)
+        self.prefactorEQ= -self.gamma / ((1 + self.alpha**2))
 
-        self.prefactor = -self.gamma / ((1 + self.alpha**2))
 
-
-        # Following Sci. Rep. 15, 15775 (2025), a small penalty term Stab*(1-|m|^2)m  is added to weakly enforce the normalization condition.
-        
+        # A weak penalty term Stab*(1-|m|^2)m is used to mitigate norm drift (|m|<1)
+        # observed during time integration due to discretization/solver tolerances
+        # (see Sci. Rep. 15, 15775 (2025)). In skyrmion-on-curved-geometry tests,
+        # the full prefactor slightly perturbed the trajectory; using 0.5*Stab
+        # eliminate this effect while keeping |m| close to 1.
+                
 
         self.Stab = self.Ms * self.gamma / (1 + self.alpha**2)*0.5
 
-        self.n_nodes_local = len(self.mesh.geometry.x)
+        self.n_nodes_local =  self.V.dofmap.index_map.size_local
+
+        self.start, self.end = self.V.dofmap.index_map.local_range
+        owned_dofs = self.end - self.start
+        self.local_dofs = self.end - self.start
+        self.local_size = 3 * self.local_dofs
+
+
         self.coords = self.mesh.geometry.x
 
         self.mx = np.zeros(self.n_nodes_local)
@@ -103,13 +119,27 @@ class EffectiveField:
         self.mcmy = np.zeros(self.n_nodes_local)
         self.mcmz = np.zeros(self.n_nodes_local)
         self.norma = np.zeros(self.n_nodes_local)
+
+
+
         self.Hfield = np.zeros(3 * self.n_nodes_local)
 
+        self.He = np.zeros(3 * self.n_nodes_local)
+
     
-        self.start, self.end = self.V.dofmap.index_map.local_range
-        owned_dofs = self.end - self.start
-        self.local_dofs = self.end - self.start
-        self.local_size = 3 * self.local_dofs
+
+
+
+
+
+        if self.H_time_func is not None:
+            self.Ht = np.zeros(self.local_size, dtype=np.float64)     # flat (3*N_owned)
+            self.Ht_view = self.Ht.reshape((-1, 3))                   # vista (N_owned,3)
+        else:
+            self.Ht = None
+            self.Ht_view = None
+
+
 
         v = ufl.TestFunction(self.V)
         tmp_0 = ufl.dot( v, Constant(self.mesh, PETSc.ScalarType((1.0, 1.0, 1.0)))) * ufl.dx
@@ -121,22 +151,29 @@ class EffectiveField:
         volN_f.x.scatter_forward()
         volN = volN_f.x.array
 
-        self.Hvec = np.zeros(3 * self.n_nodes_local)
+
         self.dmdt = fem.Function(self.V)
 
         # ---------------- Effective fields contributions ----------------
         self.demag_field = None
         if self.use_demag:
+            from .Demag import make_demag_field  
+            if demag_kwargs is None:
+                demag_kwargs = {}
 
             if self.mesh.comm.rank == 0:
-                print("[Demag] Precomputing the demagnetizing field...", flush=True)
+                print(f"[Demag] Precomputing demag method='{demag_method}' ...", flush=True)
+
             t0 = perf_counter()
-
-            self.demag_field = DemagField(self.mesh, self.V, self.V1, self.Ms)
-
+            self.demag_field = make_demag_field(
+                demag_method, self.mesh, self.V, self.V1, self.Ms, **demag_kwargs
+            )
             t1 = perf_counter()
+
             if self.mesh.comm.rank == 0:
                 print(f"[Demag] Precomputation finished in {t1 - t0:.2f} s", flush=True)
+
+
 
         self.exchange_field = ExchangeField(
             self.mesh, self.V, self.A, self.Ms, volN 
@@ -160,11 +197,11 @@ class EffectiveField:
 
         if abs(self.Kc1) > 0.0:
             if (u1_cub is None) or (u2_cub is None):
-                raise ValueError("Kc1 != 0 but u1 or u2 is None")
+                raise ValueError("Kc1 != 0 but u1_cub/u2_cub were not provided")
 
             self.cubic_field = CubicAnisotropyField(self.mesh, self.V, self.Kc1, self.Ms,u1=u1_cub, u2=u2_cub)
 
-            # buffer para Hv_cubic en jac_times_vec (solo owned)
+            # buffer for Hv_cubic in jac_times_vec (owned)
             self.Hv_cubic = np.zeros((self.local_dofs, 3), dtype=np.float64)
 
 
@@ -192,18 +229,81 @@ class EffectiveField:
         self.M_cached = np.zeros((owned_dofs, 3))
         self.Hm_cached = np.zeros((owned_dofs, 3))
 
+        self.H0_ext = fem.Function(self.V)
+
 
 
         # H0_static must be 3*N (flattened as m)
         if H0_static is not None:
-            self.H0_static = np.array(H0_static, copy=True)
-        else:
-            self.H0_static = np.zeros(3 * self.n_nodes_local)
+            self.H0_ext.x.array[:] = np.array(H0_static, copy=True)
+            self.H0_ext.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
 
-        self.H0_static = np.ascontiguousarray(self.H0_static)
-        self.H0_owned = self.H0_static[:self.local_size].reshape((-1, 3))
+        else:
+            self.H0_ext.x.array[:] = 0
+
+        self.H0_static = self.H0_ext.x.array
+        
+        #self.H0_owned = self.H0_static[:self.local_size].reshape((-1, 3))
 
         self.current_time = 0.0  
+
+    def _add_time_field_inplace(self, H_flat, t):
+        """
+        Adds the external time-dependent field to the flat vector H_flat (3*N_local).
+        """
+        if self.H_time_func is None:
+            return
+
+        try:
+            Ht = self.H_time_func(t, self.coords)
+        except TypeError:
+            Ht = self.H_time_func(t)
+
+        Ht = np.asarray(Ht, dtype=np.float64)
+
+
+        if Ht.shape == (3,):
+            H_flat[0::3] += Ht[0]
+            H_flat[1::3] += Ht[1]
+            H_flat[2::3] += Ht[2]
+        elif Ht.shape == (self.coords.shape[0], 3):
+            H_flat[:] += Ht.ravel()
+        else:
+
+            if Ht.size != H_flat.size:
+                raise ValueError(f"H_time_func has size={Ht.size}, but expected {H_flat.size} (3*N_local)")
+            H_flat[:] += Ht.reshape(-1)
+
+    def _eval_H_time(self, t):
+        """
+        Evaluate H_time_func(t) and return a flat vector (3*N_owned) in self.Ht.
+        """
+        if self.H_time_func is None:
+            return None
+
+        out = self.H_time_func(float(t))
+        if out is None:
+            raise RuntimeError("H_time_func is NONE")
+
+        arr = np.asarray(out, dtype=np.float64)
+
+        if arr.ndim == 1 and arr.size == 3:
+
+            self.Ht_view[:, 0] = arr[0]
+            self.Ht_view[:, 1] = arr[1]
+            self.Ht_view[:, 2] = arr[2]
+            return self.Ht
+
+        if arr.ndim == 1 and arr.size == self.local_size:
+            self.Ht[:] = arr
+            return self.Ht
+
+        raise ValueError(
+            f"H_time_func returned shape {arr.shape}. "
+            f" Expected (3,) or ({self.local_size},)."
+        )
+
+
 
 
     def compute_H_eff(self, m):
@@ -216,36 +316,42 @@ class EffectiveField:
         - uniaxial anisotropy (optional)
         - bulk DMI (optional)
         - interfacial DMI (optional)
-        - cubic Anisotropy
         - external field: static + time-dependent (optional)
         """
 
-        He = self.H_eff.x.array
 
-
-        He[:] = self.exchange_field.compute(m).x.array
+        self.He[:] = self.exchange_field.compute(m).x.petsc_vec.array
         
         if self.demag_field is not None:
-            He += self.demag_field.compute(m).x.array
+            self.He += self.demag_field.compute(m).x.petsc_vec.array
 
         if abs(self.Ku) > 0.0:
-            He += self.anisotropy_field.compute(m).x.array
+            self.He += self.anisotropy_field.compute(m).x.petsc_vec.array
 
         if abs(self.D_bulk) > 0.0:
-            He += self.DMIBULK.compute(m).x.array
+            self.He += self.DMIBULK.compute(m).x.petsc_vec.array
 
         if self.DMI_int is not None and abs(self.D_int) > 0.0:
-            He += self.DMI_int.compute(m).x.array
+            self.He += self.DMI_int.compute(m).x.petsc_vec.array
+
+        #if self.H_time_func is not None:
+        #    self.He += self._eval_H_time(self.current_time)
 
         if self.cubic_field is not None:
-            He += self.cubic_field.compute(m).x.array
+            self.He += self.cubic_field.compute(m).x.petsc_vec.array
 
-        He += self.H0_static
+        self.He += self.H0_ext.x.petsc_vec.array
+
+        if self.H_time_func is not None:
+            self._add_time_field_inplace(self.He, self.current_time)
 
 
-        self.H_eff.x.scatter_forward()
+            
 
-        return He
+
+        #self.H_eff.x.scatter_forward()
+
+        return self.He
 
     # ---------- Compute total energy ----------
     def compute_Energy(self, m):
@@ -273,55 +379,50 @@ class EffectiveField:
         return E_exch + E_demag + E_ani + E_dmi_bulk + E_dmi_int+ E_cub
 
     # ---------- Jacobian times vector ----------
-    def update_jac_state(self, m_vec):
+    def update_jac_state(self):
         """
         m_vec: local NumPy view of m.x.array (length = 3*local_dofs)
         """
-        self.m_jac.x.array[:self.local_size] = m_vec
+        self.K_total.mult(self.m.x.petsc_vec, self.H_m.x.petsc_vec)
 
-        self.m_jac.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,mode=PETSc.ScatterMode.FORWARD,)
-
-        self.H_m.x.petsc_vec.set(0.0)
-        self.K_total.mult(self.m_jac.x.petsc_vec, self.H_m.x.petsc_vec)
-        self.H_m.x.scatter_forward()
-
-        M_loc = m_vec.reshape(-1, 3)
-        Hm_loc = self.H_m.x.array[:self.local_size].reshape(-1, 3)
+        M_loc = self.m.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
+        Hm_loc = self.H_m.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
 
         if self.cubic_field is not None:
-            Hc = self.cubic_field.compute(self.m_jac).x.array[:self.local_size].reshape(-1, 3)
+            self.m.x.scatter_forward()
+            Hc = self.cubic_field.compute(self.m).x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
             Hm_loc = Hm_loc + Hc
 
         self.M_cached[:, :] = M_loc
-        self.Hm_cached[:, :] = Hm_loc + self.H0_owned
+        Hext = self.H0_ext.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
+
+
+        if self.H_time_func is not None:
+            Ht = self._eval_H_time(self.current_time).reshape(-1, 3)
+            self.Hm_cached[:, :] = Hm_loc + Hext + Ht
+        else:
+            self.Hm_cached[:, :] = Hm_loc + Hext
 
     def jac_vec_times(self, m_unused, v, out):
 
-
         self.JacSteps += 1
 
-        self.H_v.x.petsc_vec.set(0.0)
-
-
         self.v_jac.x.array[:self.local_size] = v
-        self.v_jac.x.petsc_vec.ghostUpdate( addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD,)
 
         self.K_total.mult(self.v_jac.x.petsc_vec, self.H_v.x.petsc_vec)
-        self.H_v.x.scatter_forward()
-
-
-        
 
         M = self.M_cached
         Hm = self.Hm_cached  
  
-        #
         V = v.reshape(-1, 3)
-        Hv_lin = self.H_v.x.array[:self.local_size].reshape(-1, 3)
+
+        Hv_lin = self.H_v.x.petsc_vec.getArray(readonly=True).reshape(-1, 3)
+
+
 
         Hv = Hv_lin 
 
-            
+            # ---- cubic anisotropy: Hv += (dHc/dm) v ----
         if self.cubic_field is not None:
             self.cubic_field.jac_times_vec_owned(M, V, self.Hv_cubic)
             Hv = Hv_lin + self.Hv_cubic
@@ -355,12 +456,12 @@ class EffectiveField:
 
         out[:] = Jv.reshape(-1)
 
-    # ---------- RHS LLG ----------
+
     def llg_rhs(self, m):
         self.LLGSteps += 1
 
-        m_numeric = m.x.array
-        self.Hfield[:] = self.compute_H_eff(m)
+        m_numeric = m.x.petsc_vec.getArray(readonly=True)           
+        self.Hfield[:] = self.compute_H_eff(m)                     
 
         self.mx[:] = m_numeric[0::3]
         self.my[:] = m_numeric[1::3]
@@ -380,24 +481,29 @@ class EffectiveField:
         self.mcmy[:] = self.mz * self.mcx - self.mx * self.mcz
         self.mcmz[:] = self.mx * self.mcy - self.my * self.mcx
 
-        self.dmdt.x.array[0::3] = self.prefactor * (self.do_precess * self.mcx + self.alpha * self.mcmx) + self.Stab*(1.0 - self.norma) * self.mx[:]
-        self.dmdt.x.array[1::3] = self.prefactor * (self.do_precess * self.mcy + self.alpha * self.mcmy) + self.Stab*(1.0 - self.norma) * self.my[:]
-        self.dmdt.x.array[2::3] = self.prefactor * (self.do_precess * self.mcz + self.alpha * self.mcmz) + self.Stab*(1.0 - self.norma) * self.mz[:] 
+        self.dmdt.x.petsc_vec.array[0::3] = self.prefactorEQ * (self.do_precess * self.mcx + self.alpha * self.mcmx) + self.Stab*(1.0 - self.norma) * self.mx[:]
+        self.dmdt.x.petsc_vec.array[1::3] = self.prefactorEQ* (self.do_precess * self.mcy + self.alpha * self.mcmy) + self.Stab*(1.0 - self.norma) * self.my[:]
+        self.dmdt.x.petsc_vec.array[2::3] = self.prefactorEQ * (self.do_precess * self.mcz + self.alpha * self.mcmz) + self.Stab*(1.0 - self.norma) * self.mz[:] 
 
         return self.dmdt
 
+
+
+
+
     # ---------- IFunction  ----------
     def ifunction(self, ts, t, y, ydot, f):
+
 
         #self.LLGSteps += 1
 
         self.current_time = t
 
-        y.copy(self.m.x.petsc_vec)
-        self.m.x.scatter_forward()
+        y.copy(self.m.x.petsc_vec)   #copy y in m local
+        self.m.x.scatter_forward()   #update ghost to calculate the effective field
 
         dmdt = self.llg_rhs(self.m)
-        dmdt.x.scatter_forward()
+        #dmdt.x.scatter_forward()
 
         f.waxpy(-1.0, dmdt.x.petsc_vec, ydot)
         return 0
@@ -405,9 +511,12 @@ class EffectiveField:
 
 
     def set_uniform_field(self, Hx, Hy, Hz):
-        self.H0_static[0::3] = Hx
-        self.H0_static[1::3] = Hy
-        self.H0_static[2::3] = Hz
+
+        self.H0_ext.x.array[0::3] = Hx
+        self.H0_ext.x.array[1::3] = Hy
+        self.H0_ext.x.array[2::3] = Hz
+
+        self.H0_ext.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)   
 
 
 
@@ -416,8 +525,11 @@ class EffectiveField:
 
 
 class StopByMaxDmdtFD:
-
-
+    """
+    Estimates max |dm/dt| (deg/ns) using a finite difference between accepted time steps.
+    Does not evaluate H_eff
+    Does not depend on ydot
+    """
     def __init__(self, comm, stopping_dm_dt_deg_ns, vec_template,
                 check_every=10, print_every_hit=True):
         self.comm = comm
@@ -583,12 +695,14 @@ class JvContext:
 
         a1_2 = a1*a1; a2_2 = a2*a2; a3_2 = a3*a3
 
+        # gradient of s1,s2,s3:
         g1 = u1*(a2_2 + a3_2)[:,None] + (2.0*a1*a2)[:,None]*u2 + (2.0*a1*a3)[:,None]*u3
         g2 = u2*(a3_2 + a1_2)[:,None] + (2.0*a2*a3)[:,None]*u3 + (2.0*a2*a1)[:,None]*u1
         g3 = u3*(a1_2 + a2_2)[:,None] + (2.0*a3*a1)[:,None]*u1 + (2.0*a3*a2)[:,None]*u2
 
-
-        diag = pref*(u1*g1 + u2*g2 + u3*g3)    
+        # diagonal of JH = pref*(u1 o g1 + u2 o g2 + u3 o g3)
+        # diag(j) = pref*(u1*g1 + u2*g2 + u3*g3) 
+        diag = pref*(u1*g1 + u2*g2 + u3*g3)     # (n,3)
 
         out_kappa[:] = (np.abs(diag[:,0]) + np.abs(diag[:,1]) + np.abs(diag[:,2])) / 3.0
 
@@ -598,7 +712,7 @@ class JvContext:
         xv = x.getArray(readonly=True)
         yv = y.getArray()
 
-        m_vec = self.hef.m.x.petsc_vec.getArray(readonly=True)
+        #m_vec = self.hef.m.x.petsc_vec.getArray(readonly=True)
         self.hef.jac_vec_times(None, xv, out=self.hef.Jv_buffer)
 
         yv[:] = self.shift * xv - self.hef.Jv_buffer
@@ -779,6 +893,7 @@ class LLG:
         self._D_int = 0.0
         self._n0_int = None
         self._H0_vec = None    
+        self._H_time_func = None
 
 
         self._Kc1 = 0.0
@@ -791,6 +906,9 @@ class LLG:
         self._has_dmi_bulk = False
         self._has_dmi_int = False
         self._has_cubic = False
+
+        self._demag_method = "lindholm"
+        self._demag_kwargs = {}
 
         self.hef: EffectiveField | None = None
 
@@ -807,8 +925,10 @@ class LLG:
         self._Aex = Aex
         self._has_exchange = True
 
-    def add_demag(self):
-        self._has_demag = True 
+    def add_demag(self, method="lindholm", **kwargs):
+        self._has_demag = True
+        self._demag_method = method
+        self._demag_kwargs = dict(kwargs)
 
     def add_anisotropy(self, Ku, n_vec):
         self._Ku = Ku
@@ -825,12 +945,20 @@ class LLG:
         self._has_dmi_int = True
 
     def add_external_field(self, H0_vec=None, H_time_func=None):
-
+        """
+        Zeeman:
+          - H0_vec: static field (3*N, array ).
+          - H_time_func: H(t, coords) -> (N, 3) or (3N,).
+        """
         self._H0_vec = H0_vec
+        self._H_time_func = H_time_func
 
 
     def add_cubic_anisotropy(self, Kc1, u1_vec, u2_vec):
-
+        """
+        u1_vec, u2_vec: arrays of length 3*N, ordered according to the DOFs of V (same convention as n_ani_vec).
+        u3 is constructed internally as the cross product u1 x u2 in the cubic anisotropy class.
+        """
         self._Kc1 = float(Kc1)
         self._u1_cub = u1_vec
         self._u2_cub = u2_vec
@@ -869,7 +997,9 @@ class LLG:
             u1_cub = None
             u2_cub = None
 
-        H0_static = self._H0_vec   # can be none
+        H0_static = self._H0_vec
+        H_time_func = self._H_time_func
+
 
         self.hef = EffectiveField(
             self.mesh,
@@ -887,7 +1017,10 @@ class LLG:
             alpha=self.alpha,
             do_precess=self.do_precess,
             use_demag=self._has_demag,
+            demag_method=self._demag_method,
+            demag_kwargs=self._demag_kwargs,
             H0_static=H0_static,
+            H_time_func=H_time_func,
         )
 
     def _cancel_ts_monitors(self):
@@ -922,7 +1055,6 @@ class LLG:
 
 
     def _run_ts(self):
-        """run TS.solve(self.y) and synchronize hef.m at the end."""
         ts = self.ts
         hef = self.hef
         y = self.y
@@ -933,6 +1065,8 @@ class LLG:
 
         y.copy(hef.m.x.petsc_vec)
         hef.m.x.scatter_forward()
+
+        print("LLGCAlls", hef.LLGSteps)
 
         stats = {
             "t_end": float(ts.getTime()),
@@ -960,8 +1094,8 @@ class LLG:
 
     def _ensure_solver(self, m0_array, dt_init,
                     ts_rtol=1e-6, ts_atol=1e-6,
-                    snes_rtol=1e-2, snes_atol=1e-4,
-                    ksp_rtol=1e-4,
+                    snes_rtol=1e-3, snes_atol=1e-5,
+                    ksp_rtol=1e-5,
                     stopping_dmdt=0.0,
                     check_every_stop=10, stop_print=False):
 
@@ -1026,10 +1160,11 @@ class LLG:
             pc.setPythonContext(ctx)
 
             def IJac(ts_, t, y, ydot, shift, A, B):
-                y.copy(hef.m.x.petsc_vec)
-                hef.m.x.scatter_forward()
-                mloc = hef.m.x.petsc_vec.getArray(readonly=True)
-                hef.update_jac_state(mloc)
+                
+                hef.current_time = t
+                y.copy(hef.m.x.petsc_vec)      #copy y in m local
+                hef.update_jac_state()
+
                 ctx.update_pc_full_fast(shift, include_stab=True, use_abs_kappa=True)
                 return PETSc.Mat.Structure.SAME_NONZERO_PATTERN
 
@@ -1038,8 +1173,7 @@ class LLG:
             ts.setFromOptions()
 
             y = hef.m.x.petsc_vec.copy()
-            y.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,
-                        mode=PETSc.ScatterMode.FORWARD)
+            y.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,mode=PETSc.ScatterMode.FORWARD)
             ts.setSolution(y)
 
             stopper = StopByMaxDmdtFD(
@@ -1097,7 +1231,7 @@ class LLG:
         Returns: (y, ctx, elapsed) or (y, ctx, elapsed, stats) if return_stats=True.
         """
 
-        # 1) asegurar solver persistente (crea TS/J/PC una sola vez)
+        
         self._ensure_solver(
             m0_array=m0_array,
             dt_init=dt_init,
@@ -1116,8 +1250,11 @@ class LLG:
 
         if m0_array is not None:
             hef.m.x.array[:] = m0_array
-            hef.m.x.scatter_forward()
             y.copy(hef.m.x.petsc_vec)
+            hef.m.x.scatter_forward()
+
+        hef.compute_H_eff(hef.m)
+            
 
         if dt_save is not None:
             if dt_snap is None:
@@ -1136,6 +1273,7 @@ class LLG:
             first_print = {"done": False}
 
             def default_monitor(ts_, step, t, u, hef_, mesh_):
+
                 dt_ts = ts_.getTimeStep()
 
                 Exch = hef_.exchange_field.Energy(hef_.m)
@@ -1156,6 +1294,9 @@ class LLG:
 
                 mag = mesh_.comm.gather(hef_.m.x.petsc_vec.getArray(readonly=True), root=0)
 
+
+
+
                 torque_norm = np.sqrt(hef_.mcx**2 + hef_.mcy**2 + hef_.mcz**2)
                 max_torque_local = float(np.max(torque_norm)) if torque_norm.size else 0.0
                 max_torque_all = mesh_.comm.gather(max_torque_local, root=0)
@@ -1175,6 +1316,10 @@ class LLG:
 
                 if mesh_.comm.rank == 0:
                     mag = np.reshape(np.concatenate(mag), (-1, 3))
+
+
+
+
                     E_exch = float(np.sum(Exch_total))
                     E_demag = float(np.sum(Demag_total))
                     E_ani = float(np.sum(Ani_total))
@@ -1188,6 +1333,14 @@ class LLG:
                     Hx_ext_mean = Hext[:, 0].mean()
                     Hy_ext_mean = Hext[:, 1].mean()
                     Hz_ext_mean = Hext[:, 2].mean()
+
+                    if hef_.H_time_func is not None:
+                        Ht = np.asarray(hef_.H_time_func(float(t)), dtype=float)
+                        if Ht.shape != (3,):
+                            raise ValueError("Para campo uniforme, H_time_func(t) debe devolver un vector (3,).")
+                        Hx_ext_mean += Ht[0]
+                        Hy_ext_mean += Ht[1]
+                        Hz_ext_mean += Ht[2]
 
 
                     maxtorque = 4 * np.pi * 1e-7 * float(max(max_torque_all)) if max_torque_all else 0.0
@@ -1275,7 +1428,7 @@ class LLG:
         snes_atol=1e-4,
         ksp_rtol=1e-4,
         stopping_dmdt=0.0,
-        check_every_stop=5,
+        check_every_stop=10,
         stop_print=False,
         xdmf_name="Hysteresis.xdmf",          
         log_name="hysteresis_log.txt",
