@@ -5,14 +5,7 @@ from petsc4py import PETSc
 from dolfinx.fem.petsc import assemble_matrix
 
 class DMIBULK:
-    def __init__(self, mesh, V, V1, D, Ms,  VolNodos):     
-
-        '''
-        D: Bulkd dzyaloshinskii-moriya constant in units of J/m^2
-        Ms: Saturation magnetisation in units of A/m
-        H_DMI:  Bulk dzyaloshinskii-moriya field in unit of A/m
-        '''
-
+    def __init__(self, mesh, V, V1, D, Ms,  VolNodos):         
         mesh_in_nm = True
         self.mu0   = 4*np.pi*1e-7
         self.M_s = Ms
@@ -38,16 +31,15 @@ class DMIBULK:
 
 
     def compute(self, m):
-        self.H_DMI.x.petsc_vec.set(0.0)
-        self.K.mult(m.x.petsc_vec, self.H_DMI.x.petsc_vec )
-        self.H_DMI.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
+        #self.H_DMI.x.petsc_vec.set(0.0)
+        self.K.mult(m.x.petsc_vec, self.H_DMI.x.petsc_vec ) # K is local, we do not update the ghost in this part
+        #self.H_DMI.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
     
         return self.H_DMI
 
 
-
     def Energy(self, m):
-
+        self.H_DMI.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES,     mode=PETSc.ScatterMode.FORWARD)    
         dE = ufl.inner(m, self.H_DMI) * ufl.dx
         energy = 0.5 * self.mu0 * self.M_s *fem.assemble_scalar(fem.form(dE))
         return energy  *1e-27
