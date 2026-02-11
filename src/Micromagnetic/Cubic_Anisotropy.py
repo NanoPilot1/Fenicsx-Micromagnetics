@@ -143,6 +143,6 @@ class CubicAnisotropyField:
 
         self.compute(m)
 
-        integrand = -ufl.dot(m, self.H) * ufl.dx
-        Eloc = fem.assemble_scalar(fem.form(integrand))
-        return 0.25 * self.mu_0 * self.M_s * float(Eloc) * self.vol_scale
+        dE = -ufl.dot(m, self.H) * ufl.dx
+        Eloc = fem.assemble_scalar(fem.form(dE))
+        return 0.25 * self.mu_0 * self.M_s * float(Eloc) * 1e-27
