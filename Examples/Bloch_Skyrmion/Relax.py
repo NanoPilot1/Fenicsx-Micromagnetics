@@ -69,7 +69,9 @@ Ku = 2.5e5                  # J/m^3
 llg = LLG(mesh, Ms = Ms, gamma=2.211e5, alpha=1.0, do_precess=0)
 
 llg.add_exchange(Aex=Aex)
-llg.add_demag()
+llg.add_demag(method="lindholm")
+#llg.add_demag(method="bempp")
+#llg.add_demag(method="fmm")
 llg.add_anisotropy(Ku, uaxis)
 llg.add_dmi_bulk(D_bulk)
 
