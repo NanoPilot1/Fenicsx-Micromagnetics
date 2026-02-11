@@ -129,7 +129,7 @@ def ensure_serial_meshfile_from_parallel_mesh(mesh_par, out_dir=None, prefer="bp
     if tag is None:
         tag = uuid.uuid4().hex
 
-    # Intento 1: ADIOS2 (.bp)
+    # ADIOS2 (.bp)
     if prefer.lower() == "bp":
         try:
             import adios4dolfinx as ad
@@ -145,7 +145,7 @@ def ensure_serial_meshfile_from_parallel_mesh(mesh_par, out_dir=None, prefer="bp
                 print(f"[WARN] ADIOS write_mesh failed: {e}", flush=True)
             comm.Barrier()
 
-    # Intento 2: XDMF/HDF5
+    # XDMF/HDF5
     xdmf_path = out_dir / f"__demag_serial_{tag}.xdmf"
     with io.XDMFFile(comm, str(xdmf_path), "w") as xdmf:
         xdmf.write_mesh(mesh_par)
