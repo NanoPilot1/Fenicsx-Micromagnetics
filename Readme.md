@@ -19,11 +19,6 @@ A Backward Differentiation Formula (BDF) scheme is employed for time integration
 The implementation supports MPI-based parallel execution.  
 For simplicity, the entire codebase is written in Python.
 
-For implicit time stepping we use a matrix-free Jacobian–vector product (JVP) strategy,
-as commonly employed in Newton–Krylov methods for large-scale ODE/DAE systems and in
-micromagnetic solvers. Comparable formulations appear in established frameworks such
-as Finmag and Nmag.
-
 ## Software Requirements
 
 To run the code, the following software is required:
@@ -55,4 +50,5 @@ cd Fenicsx-Micromagnetics/src/
 pip install -e 
 
  
+
 
