@@ -14,7 +14,7 @@ evaluation runs on a CUDA PETSc vector.
 
 Conventions
 -----------
-- Mesh coordinates are assumed to be in nm.
+- Mesh coordinates are assumed to be in m.
 - compute(m_gpu) expects a PETSc.Vec CUDA vector.
 - Energy(m_fun) expects a dolfinx.fem.Function on the host.
 """
