@@ -32,7 +32,7 @@ comm = MPI.COMM_WORLD
 with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "disk.xdmf", "r") as xdmf:
      mesh = xdmf.read_mesh(name="Grid")
 
-# 2.  Initial state and anisotropy easy axis (considered along z-axis).
+# 2.  Initial state and constant external magnetic field along x-axis.
 
 xyz = mesh.geometry.x
 n = xyz.shape[0]
@@ -56,6 +56,7 @@ m0_array = m0.flatten()
 
 
 # 3. Material parameters 
+
 Ms = 8.0e5                 # A/m
 Aex = 13.0e-12              # J/m
 
