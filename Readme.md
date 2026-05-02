@@ -1,5 +1,8 @@
 # Fenicsx-Micromagnetics
-This repository provides a research-oriented micromagnetic framework prototype (early-stage) for solving the Landau-Lifshitz-Gilbert (LLG) equation with the finite element method in FEniCSx (PETSc/MPI).
+
+This repository provides a research-oriented micromagnetic framework prototype (early-stage) for solving the Landau-Lifshitz-Gilbert (LLG) equation with the finite element method in FEniCSx.
+
+The repository contains two execution backends: a default CPU/MPI backend and GPU/CUDA backend. The CPU/MPI backend is the main implementation, while the GPU/CUDA backend has its Docker-based installation workflow.
 
 ## Features
 
