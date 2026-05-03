@@ -441,6 +441,9 @@ class EffectiveFieldSTTGPU:
                 )
 
             self.H_demag_gpu = _dup_cuda_vec(template_out, block_size=3)
+
+        self.LLGSteps = 0
+        self.JacSteps = 0
     # -----------------------------------------------------------------
     # Host/device sync
     # -----------------------------------------------------------------
